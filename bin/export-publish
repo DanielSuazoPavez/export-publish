@@ -1,0 +1,160 @@
+#!/usr/bin/env bash
+# export-publish — stage a trimmed export of a repo and publish it as the full
+# tree of a target git repo, tagged v<version> once (tags are never moved).
+#
+#   export-publish stage   <src-dir> <out-dir> <spec-file>
+#   export-publish publish <export-dir> <target-dir> <version> <source-label>
+set -euo pipefail
+
+BOT_NAME="github-actions[bot]"
+BOT_EMAIL="github-actions[bot]@users.noreply.github.com"
+VERSION_RE='^[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?$'
+
+usage() {
+	cat >&2 <<'EOF'
+usage: export-publish stage   <src-dir> <out-dir> <spec-file>
+       export-publish publish <export-dir> <target-dir> <version> <source-label>
+EOF
+	exit 2
+}
+
+die() {
+	echo "export-publish: $*" >&2
+	exit 1
+}
+
+trim() {
+	local s="$1"
+	s="${s#"${s%%[![:space:]]*}"}"
+	s="${s%"${s##*[![:space:]]}"}"
+	printf '%s' "$s"
+}
+
+# A spec path must stay inside its root: relative, no `..` segment.
+check_rel_path() {
+	local p="$1" entry="$2"
+	[[ -n "$p" ]] || die "empty path in spec entry: $entry"
+	[[ "$p" != /* ]] || die "absolute path in spec entry: $entry"
+	[[ "/$p/" != */../* ]] || die "'..' segment in spec entry: $entry"
+}
+
+cmd_stage() {
+	[[ $# -eq 3 ]] || usage
+	local src_dir="$1" out_dir="$2" spec="$3"
+	[[ -d "$src_dir" ]] || die "source dir not found: $src_dir"
+	[[ -f "$spec" ]] || die "spec file not found: $spec"
+	if [[ -e "$out_dir" ]]; then
+		[[ -d "$out_dir" ]] || die "out dir is not a directory: $out_dir"
+		[[ -z "$(ls -A "$out_dir")" ]] || die "out dir is not empty: $out_dir"
+	fi
+
+	# Validate every entry before copying anything.
+	local -a srcs=() dests=()
+	local line entry src dest
+	while IFS= read -r line || [[ -n "$line" ]]; do
+		entry="$(trim "$line")"
+		[[ -z "$entry" || "$entry" == \#* ]] && continue
+		if [[ "$entry" == *"->"* ]]; then
+			src="$(trim "${entry%%->*}")"
+			dest="$(trim "${entry#*->}")"
+		else
+			src="$entry"
+			dest="$entry"
+		fi
+		check_rel_path "$src" "$entry"
+		check_rel_path "$dest" "$entry"
+		[[ -e "$src_dir/$src" || -L "$src_dir/$src" ]] || die "source not found for spec entry: $entry"
+		srcs+=("$src")
+		dests+=("$dest")
+	done <"$spec"
+	[[ ${#srcs[@]} -gt 0 ]] || die "spec has no entries: $spec"
+
+	mkdir -p "$out_dir"
+	local i
+	for i in "${!srcs[@]}"; do
+		src="$src_dir/${srcs[$i]}"
+		dest="$out_dir/${dests[$i]}"
+		if [[ -d "$src" && ! -L "$src" ]]; then
+			# Copy contents so two entries into one dest merge instead of nesting.
+			mkdir -p "$dest"
+			cp -a "$src/." "$dest/"
+		else
+			mkdir -p "$(dirname "$dest")"
+			cp -a "$src" "$dest"
+		fi
+	done
+	echo "staged ${#srcs[@]} entries into $out_dir"
+}
+
+emit() {
+	echo "$1=$2"
+	if [[ -n "${GITHUB_OUTPUT:-}" ]]; then
+		echo "$1=$2" >>"$GITHUB_OUTPUT"
+	fi
+}
+
+cmd_publish() {
+	[[ $# -eq 4 ]] || usage
+	local export_dir="$1" target="$2" version="$3" label="$4"
+	[[ "$version" =~ $VERSION_RE ]] || die "invalid version (want X.Y.Z, no leading v): $version"
+	[[ -d "$export_dir" ]] || die "export dir not found: $export_dir"
+	[[ -n "$(ls -A "$export_dir")" ]] || die "export dir is empty: $export_dir"
+	[[ -e "$target/.git" ]] || die "target is not a git checkout: $target"
+	export_dir="$(cd "$export_dir" && pwd)"
+	cd "$target"
+
+	local tag="v$version" rc tags previous
+	# Newest v* tag on the target strictly below this version.
+	rc=0
+	tags="$(git ls-remote --tags --refs origin 'refs/tags/v*')" || rc=$?
+	[[ $rc -eq 0 ]] || die "git ls-remote failed ($rc)"
+	previous="$({
+		sed -n 's#.*refs/tags/v##p' <<<"$tags"
+		echo "$version"
+	} | sort -uV | awk -v v="$version" '$0 == v { print p; exit } { p = $0 }')"
+
+	# Full replace, not merge: the target holds the export tree and its history only.
+	find . -mindepth 1 -maxdepth 1 ! -name .git -exec rm -rf {} +
+	cp -a "$export_dir/." .
+
+	local pushed
+	git add -A
+	if git diff --cached --quiet; then
+		pushed=false
+	else
+		git config user.name "$BOT_NAME"
+		git config user.email "$BOT_EMAIL"
+		git commit -q -m "sync: $label v$version"
+		git push -q origin HEAD
+		pushed=true
+	fi
+
+	# Immutable per version: an existing tag is left where it is. Not gated on
+	# pushed, so a re-run after a failed tag push still tags.
+	local created
+	rc=0
+	git ls-remote --exit-code --tags origin "refs/tags/$tag" >/dev/null || rc=$?
+	case "$rc" in
+	0) created=false ;;
+	2)
+		git tag "$tag"
+		git push -q origin "refs/tags/$tag"
+		created=true
+		;;
+	*) die "git ls-remote failed ($rc)" ;;
+	esac
+
+	emit version "$version"
+	emit previous-version "$previous"
+	emit pushed "$pushed"
+	emit tag-created "$created"
+}
+
+[[ $# -ge 1 ]] || usage
+cmd="$1"
+shift
+case "$cmd" in
+stage) cmd_stage "$@" ;;
+publish) cmd_publish "$@" ;;
+*) usage ;;
+esac
