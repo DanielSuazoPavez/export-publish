@@ -1,0 +1,173 @@
+name: Publish export
+
+# Reusable workflow: build a trimmed export of the calling repo and publish it
+# as the full tree of `target-repo`, tagged v<version> once (tags never move).
+# Pin it by commit SHA — it handles your deploy key.
+on:
+  workflow_call:
+    inputs:
+      target-repo:
+        description: Target repository (owner/name) whose tree is replaced by the export.
+        type: string
+        required: true
+      include:
+        description: Spec of paths to export, one per line (`path` or `src -> dest`). Exclusive with build-command.
+        type: string
+        default: ''
+      build-command:
+        description: Command run in the source checkout that fills $EXPORT_DIR. Exclusive with include.
+        type: string
+        default: ''
+      version-command:
+        description: Command run in the source checkout that prints the version (X.Y.Z).
+        type: string
+        default: python -c "import tomllib;print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])"
+      ref:
+        description: Source ref to export. Defaults to the workflow_run head SHA, else github.sha.
+        type: string
+        default: ''
+      python-version:
+        description: Python version for setup-python.
+        type: string
+        default: '3.12'
+      dry-run:
+        description: Build the export and upload it as an artifact; publish nothing.
+        type: boolean
+        default: false
+    secrets:
+      deploy-key:
+        description: Private half of a write deploy key on target-repo. Required unless dry-run.
+        required: false
+    outputs:
+      version:
+        description: The published version.
+        value: ${{ jobs.publish.outputs.version }}
+      previous-version:
+        description: Newest v* tag on the target below version, without the v; empty when none.
+        value: ${{ jobs.publish.outputs.previous-version }}
+      pushed:
+        description: "'true' when the export changed the target tree and was pushed."
+        value: ${{ jobs.publish.outputs.pushed }}
+      tag-created:
+        description: "'true' when this run created the v<version> tag."
+        value: ${{ jobs.publish.outputs.tag-created }}
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    # Serialize publishes per target: a second run queues instead of racing the push.
+    concurrency:
+      group: export-publish-${{ inputs.target-repo }}
+      cancel-in-progress: false
+    outputs:
+      version: ${{ steps.publish.outputs.version }}
+      previous-version: ${{ steps.publish.outputs.previous-version }}
+      pushed: ${{ steps.publish.outputs.pushed }}
+      tag-created: ${{ steps.publish.outputs.tag-created }}
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.ref || github.event.workflow_run.head_sha || github.sha }}
+          path: source
+          persist-credentials: false
+
+      # The script at the exact commit the caller pinned this workflow to
+      # (job.workflow_* name this reusable workflow's file, not the caller's).
+      - name: Checkout export-publish
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: .export-publish
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: ${{ inputs.python-version }}
+
+      - name: Compute version
+        id: version
+        working-directory: source
+        env:
+          VERSION_COMMAND: ${{ inputs.version-command }}
+        run: |
+          version="$(bash -c "$VERSION_COMMAND")"
+          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::version-command printed an invalid version: $version"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Check export mode
+        env:
+          INCLUDE: ${{ inputs.include }}
+          BUILD_COMMAND: ${{ inputs.build-command }}
+        run: |
+          if { [[ -n "$INCLUDE" ]] && [[ -n "$BUILD_COMMAND" ]]; } || { [[ -z "$INCLUDE" ]] && [[ -z "$BUILD_COMMAND" ]]; }; then
+            echo "::error::set exactly one of include or build-command"
+            exit 1
+          fi
+
+      - name: Stage export from include spec
+        if: inputs.include != ''
+        env:
+          INCLUDE: ${{ inputs.include }}
+        run: |
+          spec="$RUNNER_TEMP/export-spec"
+          printf '%s\n' "$INCLUDE" > "$spec"
+          .export-publish/bin/export-publish stage source "$RUNNER_TEMP/export" "$spec"
+
+      - name: Build export
+        if: inputs.build-command != ''
+        working-directory: source
+        env:
+          BUILD_COMMAND: ${{ inputs.build-command }}
+          EXPORT_DIR: ${{ runner.temp }}/export
+        run: |
+          mkdir -p "$EXPORT_DIR"
+          bash -eo pipefail -c "$BUILD_COMMAND"
+          if [[ -z "$(ls -A "$EXPORT_DIR")" ]]; then
+            echo "::error::build-command left EXPORT_DIR empty"
+            exit 1
+          fi
+
+      - name: Upload export (dry run)
+        if: inputs.dry-run
+        uses: actions/upload-artifact@v4
+        with:
+          name: export
+          path: ${{ runner.temp }}/export
+          include-hidden-files: true
+          if-no-files-found: error
+
+      - name: Require deploy key
+        if: ${{ !inputs.dry-run }}
+        env:
+          DEPLOY_KEY: ${{ secrets.deploy-key }}
+        run: |
+          if [[ -z "$DEPLOY_KEY" ]]; then
+            echo "::error::secret deploy-key is required unless dry-run is true"
+            exit 1
+          fi
+
+      - name: Checkout target
+        if: ${{ !inputs.dry-run }}
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ inputs.target-repo }}
+          ssh-key: ${{ secrets.deploy-key }}
+          path: target
+
+      - name: Publish
+        id: publish
+        if: ${{ !inputs.dry-run }}
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          SOURCE_REPO: ${{ github.repository }}
+        run: |
+          sha="$(git -C source rev-parse --short HEAD)"
+          .export-publish/bin/export-publish publish "$RUNNER_TEMP/export" target "$VERSION" "$SOURCE_REPO@$sha"
