@@ -30,12 +30,16 @@ trim() {
 	printf '%s' "$s"
 }
 
-# A spec path must stay inside its root: relative, no `..` segment.
+# A spec path must stay inside its root: relative, no `..` segment. A `.` or
+# `.git` segment could carry a git dir into the export, which would replace the
+# target checkout's own .git on publish.
 check_rel_path() {
 	local p="$1" entry="$2"
 	[[ -n "$p" ]] || die "empty path in spec entry: $entry"
 	[[ "$p" != /* ]] || die "absolute path in spec entry: $entry"
 	[[ "/$p/" != */../* ]] || die "'..' segment in spec entry: $entry"
+	[[ "/$p/" != */./* ]] || die "'.' segment in spec entry: $entry"
+	[[ "/$p/" != */.git/* ]] || die "'.git' segment in spec entry: $entry"
 }
 
 cmd_stage() {
@@ -99,19 +103,25 @@ cmd_publish() {
 	[[ "$version" =~ $VERSION_RE ]] || die "invalid version (want X.Y.Z, no leading v): $version"
 	[[ -d "$export_dir" ]] || die "export dir not found: $export_dir"
 	[[ -n "$(ls -A "$export_dir")" ]] || die "export dir is empty: $export_dir"
+	[[ ! -e "$export_dir/.git" ]] || die "export dir contains .git, which would replace the target's: $export_dir"
 	[[ -e "$target/.git" ]] || die "target is not a git checkout: $target"
 	export_dir="$(cd "$export_dir" && pwd)"
 	cd "$target"
 
-	local tag="v$version" rc tags previous
-	# Newest v* tag on the target strictly below this version.
+	local tag="v$version" rc tags sorted previous newer
 	rc=0
 	tags="$(git ls-remote --tags --refs origin 'refs/tags/v*')" || rc=$?
 	[[ $rc -eq 0 ]] || die "git ls-remote failed ($rc)"
-	previous="$({
+	sorted="$({
 		sed -n 's#.*refs/tags/v##p' <<<"$tags"
 		echo "$version"
-	} | sort -uV | awk -v v="$version" '$0 == v { print p; exit } { p = $0 }')"
+	} | sort -uV)"
+	# Newest v* tag on the target strictly below this version.
+	previous="$(awk -v v="$version" '$0 == v { print p; exit } { p = $0 }' <<<"$sorted")"
+	# A tag above this version means a newer export is already published: a stale
+	# or out-of-order run must not roll the target's tree back.
+	newer="$(awk -v v="$version" 'found { print; exit } $0 == v { found = 1 }' <<<"$sorted")"
+	[[ -z "$newer" ]] || die "target already has v$newer, newer than v$version; refusing to publish an older export"
 
 	# Full replace, not merge: the target holds the export tree and its history only.
 	find . -mindepth 1 -maxdepth 1 ! -name .git -exec rm -rf {} +

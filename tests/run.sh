@@ -112,6 +112,12 @@ result "stage fails on absolute path" "$rc"
 rc=0; mkdir -p "$TMP/s2d" && touch "$TMP/s2d/keep"
 expect_stage_fail "$TMP/s2d" "$(spec 'README.md')" "not empty" || rc=1
 result "stage fails on non-empty out-dir" "$rc"
+rc=0; expect_stage_fail "$TMP/s2f" "$(spec '.')" "'.' segment" || rc=1
+expect_stage_fail "$TMP/s2f" "$(spec 'lib/./sub')" "'.' segment" || rc=1
+expect_stage_fail "$TMP/s2f" "$(spec '.git')" "'.git' segment" || rc=1
+expect_stage_fail "$TMP/s2f" "$(spec 'README.md -> .git/config')" "'.git' segment" || rc=1
+[[ ! -e "$TMP/s2f" ]] || rc=1
+result "stage fails on . and .git segments" "$rc"
 rc=0; expect_stage_fail "$TMP/s2e" "$(spec '# only' '   # comments' '')" "no entries" || rc=1
 result "stage fails on spec with no entries" "$rc"
 
@@ -193,7 +199,29 @@ case_github_output() {
 }
 rc=0; case_github_output || rc=1; result "publish writes four keys to GITHUB_OUTPUT" "$rc"
 
-# 9. usage errors
+# 9. an older version after a newer one is refused, origin untouched
+case_downgrade() {
+	local main_before
+	main_before="$(origin_ref refs/heads/main)"
+	publish "$EXP1" 1.0.1
+	[[ $RC -eq 1 && "$OUT" == *"already has v1.1.0"* ]] || return 1
+	[[ -z "$(origin_ref refs/tags/v1.0.1)" ]] || return 1
+	[[ "$(origin_ref refs/heads/main)" == "$main_before" ]]
+}
+rc=0; case_downgrade || rc=1; result "publish refuses a version below the newest tag" "$rc"
+
+# 10. an export carrying .git is refused before the target is touched
+case_export_git() {
+	local exp="$TMP/exp-git"
+	cp -a "$EXP2" "$exp"
+	git init -q "$exp"
+	publish "$exp" 1.2.0
+	[[ $RC -eq 1 && "$OUT" == *"contains .git"* ]] || return 1
+	[[ -z "$(origin_ref refs/tags/v1.2.0)" ]]
+}
+rc=0; case_export_git || rc=1; result "publish refuses an export containing .git" "$rc"
+
+# 11. usage errors
 rc=0; run bogus; [[ $RC -eq 2 ]] || rc=1
 run publish a b c; [[ $RC -eq 2 ]] || rc=1
 run stage a b; [[ $RC -eq 2 ]] || rc=1

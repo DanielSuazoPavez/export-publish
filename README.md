@@ -50,7 +50,7 @@ jobs:
 | `pushed` | `true` when the export changed the target tree and was pushed. |
 | `tag-created` | `true` when this run created the `v<version>` tag. |
 
-The outputs are empty on a `dry-run`. Use `tag-created == 'true'` to announce a release exactly once per version.
+A run whose version is below the newest `v*` tag on the target fails without touching it, so a stale re-run or an out-of-order run cannot roll the target back. The outputs are empty on a `dry-run`. Use `tag-created == 'true'` to announce a release exactly once per version.
 
 ## Spec format
 
@@ -67,7 +67,7 @@ src
 docs/public -> docs
 ```
 
-Paths are relative to the repo root. Absolute paths and `..` segments are rejected, as is a missing source. A `#` comment must be on its own line.
+Paths are relative to the repo root. Absolute paths, `..`, `.` and `.git` segments are rejected, as is a missing source. An export that contains a top-level `.git` (e.g. from a `build-command`) is refused at publish. A `#` comment must be on its own line.
 
 ## Deploy-key setup
 
