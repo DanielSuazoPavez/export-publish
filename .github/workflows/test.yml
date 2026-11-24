@@ -1,0 +1,27 @@
+name: Test
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: shellcheck
+        run: shellcheck bin/export-publish tests/run.sh
+
+      - name: Script tests
+        run: bash tests/run.sh
+
+      - uses: astral-sh/setup-uv@v6
+
+      - name: actionlint
+        run: uvx --from actionlint-py actionlint
